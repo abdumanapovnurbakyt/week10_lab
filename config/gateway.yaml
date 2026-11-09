@@ -1,0 +1,135 @@
+# Конфигурация шлюза gw-01. Подстановки ${ИМЯ:-по_умолчанию} берутся из переменных окружения контейнера.
+gateway_id: gw-01
+
+api:
+  port: ${API_PORT:-8080}              # /status, /config, /dropped (внутри docker-сети; наружу опубликован на 127.0.0.1)
+
+# ---- Persistent-буфер (шаг 4): SQLite в режиме WAL, 10 000 записей по ТЗ
+buffer:
+  path: ${GW_DATA_DIR:-/data}/outbox.db
+  capacity: 10000
+  synchronous: NORMAL                  # NORMAL: переживает kill -9; FULL - ещё и потерю питания (медленнее)
+
+# ---- Облачный брокер через прокси «WAN» (в нём имитируется обрыв канала)
+uplink:
+  host: ${UPLINK_HOST:-wan-link}
+  port: ${UPLINK_PORT:-8883}
+  tls: true
+  ca: ${CA_FILE:-/certs/ca.crt}
+  keepalive_s: 10                      # обрыв «в чёрную дыру» обнаруживается за ~1.5 x keepalive
+  connect_timeout_s: 5
+  ack_timeout_s: 5                     # ждать PUBACK не дольше; потом запись возвращается в очередь
+  inflight: 20                         # окно неподтверждённых сообщений
+  reconnect_min_s: 0.5
+  reconnect_max_s: 5
+  topic_data: "gw/{gw}/data"
+  topic_alarm: "gw/{gw}/alarm"
+
+# ---- Отправка: батчинг живых данных, ограниченный по скорости backfill (шаг 6)
+publish:
+  batch_max: 10                        # записей в сообщении
+  batch_wait_ms: 500                   # или не ждать дольше
+  alarm_batch: 10
+backfill:
+  rate: 200                            # сообщений/с (0 - без ограничения)
+  batch: 1                             # записей в сообщении при backfill
+  live_age_ms: 2000                    # самая старая запись старше - значит идёт ресинхронизация
+
+# ---- Локальные тревоги (шаг 8): fast_path=true - сразу, минуя батчинг и ограничитель
+alarms:
+  fast_path: true
+rules:
+  - {id: pump01_temp_high, asset: pump-01, tag: temperature, op: ">", threshold: 85.0, hysteresis: 3.0, severity: critical}
+  - {id: pump02_vibration_high, asset: pump-02, tag: vibration, op: ">", threshold: 8.0, hysteresis: 1.0, severity: warning}
+  - {id: tank01_level_low, asset: tank-01, tag: level, op: "<", threshold: 10.0, hysteresis: 2.0, severity: warning}
+  - {id: boiler01_flame_out, asset: boiler-01, tag: flame, op: "==", threshold: false, severity: critical}
+  - {id: esp32_03_battery_low, asset: esp32-03, tag: battery, op: "<", threshold: 3.3, hysteresis: 0.05, severity: warning}
+
+# ---- Deadband (шаг 3). Правило ищется по "asset.tag", затем по шаблонам, затем default.
+deadband:
+  enabled: true
+  max_silence_s: 60                    # heartbeat: раз в минуту отправляется текущее значение, даже если оно не менялось
+  default: {abs: 0.0}                  # отправлять только изменившиеся значения
+  tags:
+    "pump-*.temperature": {abs: 0.5}
+    "pump-*.pressure": {abs: 0.05}
+    "pump-*.speed": {abs: 8}
+    "pump-*.vibration": {abs: 0.5}
+    "pump-*.current": {pct: 3.0}
+    "tank-01.level": {abs: 0.5}
+    "tank-01.temperature": {abs: 0.3}
+    "tank-01.volume": {abs: 0.15}
+    "tank-01.valve": {abs: 0}
+    "boiler-01.temperature": {abs: 0.6}
+    "boiler-01.pressure": {abs: 0.05}
+    "boiler-01.energy": {abs: 0.5}
+    "ble-*.temperature": {abs: 0.1}
+    "ble-*.humidity": {abs: 0.5}
+    "ble-*.battery": {abs: 0}
+    "esp32-*.temperature": {abs: 0.3}
+    "esp32-*.humidity": {abs: 1.0}
+    "esp32-*.battery": {abs: 0.02}
+    "esp32-*.rssi": {abs: 3}
+
+# ---- Источники
+sources:
+  modbus:                              # шаги 1-2: опрос 20 регистров раз в секунду + маппинг в канонические теги
+    enabled: true
+    host: ${MODBUS_HOST:-modbus-sim}
+    port: ${MODBUS_PORT:-1502}
+    unit: 1
+    start: 0
+    count: 20
+    poll_interval_s: 1.0
+    timeout_s: 1.0
+    word_order: big
+    link_tag: {asset: gw-01, tag: modbus_link}
+    tags:
+      - {reg: 0,  type: int16,   scale: 0.1,  unit: degC, asset: pump-01,   tag: temperature}
+      - {reg: 1,  type: uint16,  scale: 0.01, unit: bar,  asset: pump-01,   tag: pressure}
+      - {reg: 2,  type: uint16,  scale: 1,    unit: rpm,  asset: pump-01,   tag: speed}
+      - {reg: 3,  type: uint16,  scale: 0.01, unit: mm/s, asset: pump-01,   tag: vibration}
+      - {reg: 4,  type: uint16,  scale: 0.1,  unit: A,    asset: pump-01,   tag: current}
+      - {reg: 5,  type: int16,   scale: 0.1,  unit: degC, asset: pump-02,   tag: temperature}
+      - {reg: 6,  type: uint16,  scale: 0.01, unit: bar,  asset: pump-02,   tag: pressure}
+      - {reg: 7,  type: uint16,  scale: 1,    unit: rpm,  asset: pump-02,   tag: speed}
+      - {reg: 8,  type: uint16,  scale: 0.01, unit: mm/s, asset: pump-02,   tag: vibration}
+      - {reg: 9,  type: uint16,  scale: 0.1,  unit: A,    asset: pump-02,   tag: current}
+      - {reg: 10, type: uint16,  scale: 0.1,  unit: "%",  asset: tank-01,   tag: level}
+      - {reg: 11, type: int16,   scale: 0.1,  unit: degC, asset: tank-01,   tag: temperature}
+      - {reg: 12, type: float32, scale: 1,    unit: m3,   asset: tank-01,   tag: volume, decimals: 2}
+      - {reg: 14, type: uint16,  scale: 1,    unit: "%",  asset: tank-01,   tag: valve}
+      - {reg: 15, type: uint16,  scale: 0.1,  unit: degC, asset: boiler-01, tag: temperature}
+      - {reg: 16, type: uint16,  scale: 0.01, unit: bar,  asset: boiler-01, tag: pressure}
+      - {reg: 17, type: bits,    bit: 0,      unit: "",   asset: boiler-01, tag: flame}
+      - {reg: 17, type: bits,    bit: 1,      unit: "",   asset: boiler-01, tag: fault}
+      - {reg: 18, type: uint32,  scale: 0.1,  unit: kWh,  asset: boiler-01, tag: energy}
+
+  ble:                                 # BLE/GATT (эмуляция): уведомления температуры/влажности, чтение заряда
+    enabled: true
+    host: ${BLE_HOST:-ble-sim}
+    port: ${BLE_PORT:-1530}
+    link_tag: {asset: gw-01, tag: ble_link}
+    devices:
+      - addr: "AA:BB:CC:00:00:01"
+        asset: ble-01
+        chars: &ble_chars
+          - {uuid: "2A6E", fmt: sint16, scale: 0.01, unit: degC, tag: temperature, mode: notify}
+          - {uuid: "2A6F", fmt: uint16, scale: 0.01, unit: "%",  tag: humidity,    mode: notify}
+          - {uuid: "2A19", fmt: uint8,  scale: 1,    unit: "%",  tag: battery,     mode: read, period_s: 30}
+      - addr: "AA:BB:CC:00:00:02"
+        asset: ble-02
+        chars: *ble_chars
+
+  mqtt:                                # ESP32 по MQTT: локальный брокер юга, «сырые» целые -> инженерные единицы
+    enabled: true
+    host: ${SOUTH_BROKER:-broker-south}
+    port: ${SOUTH_PORT:-1883}
+    client_id: gw-01-south
+    telemetry_topic: "south/+/telemetry"
+    status_topic: "south/+/status"
+    fields:
+      - {field: t_c10,  scale: 0.1,   unit: degC, tag: temperature}
+      - {field: h_p10,  scale: 0.1,   unit: "%",  tag: humidity}
+      - {field: bat_mv, scale: 0.001, unit: V,    tag: battery}
+      - {field: rssi,   scale: 1,     unit: dBm,  tag: rssi}

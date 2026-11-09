@@ -1,0 +1,35 @@
+{
+  "limit_msgs_per_s": 200,
+  "scales": {
+    "smoke": {
+      "sweep_duration_s": 600,
+      "live_s": 12, "live_warm_s": 4,
+      "cycles": 1, "outage_s": 15, "pre_s": 5, "post_s": 5,
+      "e3b_outage_s": 15,
+      "limiter": {"outage_s": 12, "settings": [[50, 1], [0, 1]]},
+      "overflow": {"capacity": 300, "outage_s": 30},
+      "alarms": {"rounds": 1, "round_s": 50, "modes": ["fast"]},
+      "crash": {"accumulate_s": 12, "pre_s": 5, "post_s": 5}
+    },
+    "quick": {
+      "sweep_duration_s": 3600,
+      "live_s": 40, "live_warm_s": 8,
+      "cycles": 3, "outage_s": 40, "pre_s": 10, "post_s": 10,
+      "e3b_outage_s": 40,
+      "limiter": {"outage_s": 30, "settings": [[50, 1], [100, 1], [200, 1], [500, 1], [0, 1]]},
+      "overflow": {"capacity": 1000, "outage_s": 60},
+      "alarms": {"rounds": 2, "round_s": 50, "modes": ["fast", "batch"]},
+      "crash": {"accumulate_s": 25, "pre_s": 10, "post_s": 10}
+    },
+    "full": {
+      "sweep_duration_s": 3600,
+      "live_s": 120, "live_warm_s": 10,
+      "cycles": 3, "outage_s": 300, "pre_s": 30, "post_s": 20,
+      "e3b_outage_s": 300,
+      "limiter": {"outage_s": 60, "settings": [[50, 1], [100, 1], [200, 1], [500, 1], [0, 1], [200, 10]]},
+      "overflow": {"capacity": 10000, "outage_s": 480},
+      "alarms": {"rounds": 5, "round_s": 50, "modes": ["fast", "batch"]},
+      "crash": {"accumulate_s": 45, "pre_s": 15, "post_s": 15}
+    }
+  }
+}

@@ -1,0 +1,10 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.zip
+*.db
+*.db-wal
+*.db-shm
+results/*
+!results/.gitkeep

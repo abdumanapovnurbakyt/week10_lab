@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/iot-gateway/canonical.schema.json",
+  "title": "Каноническое сообщение шлюза (gw/{gw}/data и gw/{gw}/alarm)",
+  "description": "Конверт с пачкой записей. seq присваивается буфером шлюза, монотонно растёт без пропусков и переживает перезапуск; по нему приёмная сторона находит потери и дубликаты.",
+  "type": "object",
+  "required": ["v", "gw", "n", "recs"],
+  "additionalProperties": false,
+  "properties": {
+    "v": {"const": 1, "description": "версия формата"},
+    "gw": {"type": "string", "minLength": 1, "description": "идентификатор шлюза"},
+    "n": {"type": "integer", "minimum": 1, "description": "число записей в recs (контрольное)"},
+    "recs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/record"}}
+  },
+  "$defs": {
+    "record": {
+      "type": "object",
+      "required": ["seq", "ts", "asset", "tag", "val", "unit", "q", "src"],
+      "additionalProperties": false,
+      "properties": {
+        "seq": {"type": "integer", "minimum": 1, "description": "сквозной номер записи шлюза"},
+        "ts": {"type": "integer", "minimum": 0, "description": "время снятия значения, мс UTC"},
+        "asset": {"type": "string", "minLength": 1, "description": "asset_id: pump-01, tank-01, boiler-01, ble-01, esp32-01, gw-01 ..."},
+        "tag": {"type": "string", "minLength": 1, "description": "каноническое имя тега: temperature, pressure, level ..."},
+        "val": {"type": ["number", "boolean"], "description": "значение в инженерных единицах (после масштаба)"},
+        "unit": {"type": "string", "description": "единица измерения; пустая строка - безразмерное/дискретное"},
+        "q": {"enum": ["good", "bad", "stale"], "description": "качество значения"},
+        "src": {"enum": ["modbus", "ble", "mqtt", "gateway"], "description": "протокол источника"},
+        "alarm": {
+          "type": "object",
+          "required": ["id", "state", "sev", "limit"],
+          "additionalProperties": false,
+          "description": "присутствует только в записях-тревогах (локальное правило шлюза)",
+          "properties": {
+            "id": {"type": "string"},
+            "state": {"enum": ["raise", "clear"]},
+            "sev": {"enum": ["info", "warning", "critical"]},
+            "limit": {"type": ["number", "boolean"]}
+          }
+        }
+      }
+    }
+  }
+}

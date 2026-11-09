@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+*.zip
+# результаты измерений можно добавлять в репозиторий осознанно: git add -f results/results.json
+results/*
+!results/.gitkeep

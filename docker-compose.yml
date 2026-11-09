@@ -1,0 +1,166 @@
+# Lab 7 - IoT-шлюз: Modbus/BLE/MQTT -> каноническая модель -> deadband -> буфер SQLite -> MQTT/TLS -> брокер.
+#
+#   docker compose up -d --build                # поднять стенд
+#   docker compose run --rm tests               # проверки
+#   docker compose run --rm bench --scale smoke # измерения (smoke ~8 мин, quick ~25 мин (оценка), full ~70 мин)
+#
+# Сети: south (устройства и шлюз) - uplink (шлюз и «WAN»-прокси) - cloud (прокси, облачный брокер, приёмник).
+# Обрыв WAN: прокси wan-link (curl.exe -X POST "http://localhost:8081/mode?set=blackhole") либо вручную
+# `docker network disconnect lab7_uplink <контейнер шлюза>` / `tc netem` - см. README.
+name: lab7
+
+x-py: &py
+  image: lab7-gateway:local
+  build: .
+  init: true
+
+x-health: &health
+  interval: 5s
+  timeout: 3s
+  retries: 12
+  start_period: 5s
+
+networks:
+  south: {}
+  uplink: {}
+  cloud: {}
+
+volumes:
+  certs: {}        # учебные сертификаты TLS (создаёт сервис certs)
+  gw-data: {}      # буфер шлюза (SQLite) - переживает перезапуск контейнера
+
+services:
+  # ------------------------------------------------------------------ облако
+  certs:
+    <<: *py
+    command: ["python", "-m", "tools.gen_certs", "/certs"]
+    volumes: ["certs:/certs"]
+    restart: "no"
+
+  broker-wan:
+    image: eclipse-mosquitto:2
+    volumes:
+      - ./config/mosquitto-wan.conf:/mosquitto/config/mosquitto.conf:ro
+      - certs:/certs:ro
+    networks: [cloud]
+    depends_on:
+      certs: {condition: service_completed_successfully}
+    restart: unless-stopped
+
+  wan-link:                       # управляемый обрыв канала между шлюзом и облаком
+    <<: *py
+    command: ["python", "-m", "tools.wan_link"]
+    environment: {UPSTREAM_HOST: broker-wan, UPSTREAM_PORT: "8883", LINK_LISTEN: "8883", CTL_PORT: "8081"}
+    ports: ["127.0.0.1:${LINK_PORT:-8081}:8081"]
+    networks: [uplink, cloud]
+    depends_on: [broker-wan]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8081/health', timeout=2)"]
+    restart: unless-stopped
+
+  collector:                      # приёмная сторона вместо ingest/TimescaleDB: проверяет seq, считает нагрузку
+    <<: *py
+    command: ["python", "-m", "tools.collector"]
+    environment: {BROKER_HOST: broker-wan, BROKER_PORT: "8883", CA_FILE: /certs/ca.crt, CTL_PORT: "8082"}
+    volumes: ["certs:/certs:ro"]
+    ports: ["127.0.0.1:${COLLECTOR_PORT:-8082}:8082"]
+    networks: [cloud]
+    depends_on:
+      broker-wan: {condition: service_started}
+    healthcheck:
+      <<: *health
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8082/health', timeout=2)"]
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ юг: устройства
+  modbus-sim:                     # Modbus TCP, 20 holding-регистров, unit 1
+    <<: *py
+    command: ["python", "-m", "sim.modbus_sim"]
+    environment: {MODBUS_PORT: "1502", CTL_PORT: "8080"}
+    ports: ["127.0.0.1:${MODBUS_PORT:-1502}:1502"]
+    networks: [south]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+    restart: unless-stopped
+
+  ble-sim:                        # BLE/GATT (эмуляция по TCP): 2 датчика, уведомления температуры и влажности
+    <<: *py
+    command: ["python", "-m", "sim.ble_sim"]
+    environment: {BLE_PORT: "1530", CTL_PORT: "8080"}
+    networks: [south]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+    restart: unless-stopped
+
+  broker-south:                   # локальный брокер юга (ESP32 -> шлюз)
+    image: eclipse-mosquitto:2
+    volumes: ["./config/mosquitto-south.conf:/mosquitto/config/mosquitto.conf:ro"]
+    ports: ["127.0.0.1:${SOUTH_MQTT_PORT:-1883}:1883"]
+    networks: [south]
+    restart: unless-stopped
+
+  mqtt-dev:                       # 3 эмулятора ESP32, публикуют south/<dev>/telemetry
+    <<: *py
+    command: ["python", "-m", "sim.mqtt_dev"]
+    environment: {SOUTH_BROKER: broker-south, SOUTH_PORT: "1883", CTL_PORT: "8080"}
+    networks: [south]
+    depends_on: [broker-south]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ шлюз
+  gateway:
+    <<: *py
+    command: ["python", "-m", "gw.main"]
+    user: root                    # root нужен только для tc netem (cap NET_ADMIN), см. README
+    cap_add: [NET_ADMIN]
+    environment:
+      GW_CONFIG: /app/config/gateway.yaml
+      GW_DATA_DIR: /data
+      GW_CHAOS: "1"               # разрешает POST /chaos/crash (опыт E7: аварийное завершение)
+      API_PORT: "8080"
+    volumes:
+      - gw-data:/data
+      - certs:/certs:ro
+    ports: ["127.0.0.1:${GW_PORT:-8080}:8080"]
+    networks: [south, uplink]
+    depends_on:
+      certs: {condition: service_completed_successfully}
+      wan-link: {condition: service_started}
+      modbus-sim: {condition: service_started}
+      ble-sim: {condition: service_started}
+      broker-south: {condition: service_started}
+      mqtt-dev: {condition: service_started}
+    healthcheck:
+      <<: *health
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+    restart: unless-stopped       # после аварии шлюз поднимается сам, буфер читается с диска
+
+  # ------------------------------------------------------------------ тесты и измерения (по запросу)
+  tests:
+    <<: *py
+    entrypoint: ["python", "tests.py"]
+    environment: {BROKER_HOST: broker-wan, BROKER_PORT: "8883", CA_FILE: /certs/ca.crt}
+    volumes: ["certs:/certs:ro"]
+    networks: [south, uplink, cloud]
+    depends_on:
+      gateway: {condition: service_healthy}
+      collector: {condition: service_healthy}
+    profiles: ["tools"]
+
+  bench:
+    <<: *py
+    entrypoint: ["python", "-m", "lab.bench"]
+    user: root
+    volumes:
+      - ./results:/app/results
+    networks: [south, uplink, cloud]
+    depends_on:
+      gateway: {condition: service_healthy}
+      collector: {condition: service_healthy}
+    profiles: ["tools"]
